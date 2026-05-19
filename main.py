@@ -8,32 +8,28 @@ import os
 import uuid
 import hashlib
 from datetime import datetime, timezone
+import math
 
 app = FastAPI(title="SMAP Scientific Extractor")
 
 # =========================================================
-# SIMPLE DAY-LEVEL FILE CACHE
-# avoids re-downloading the 150MB file on every request
+# CACHE
 # =========================================================
 
 CACHE_DIR = "/tmp/smap_cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
 
 def cached_hdf5_path(download_url: str) -> str:
-    """Return a stable cache path for a given granule URL."""
     url_hash = hashlib.md5(download_url.encode()).hexdigest()[:12]
     return os.path.join(CACHE_DIR, f"smap_{url_hash}.h5")
 
 def ensure_downloaded(download_url: str, token: str) -> str:
-    """Download HDF5 only if not already cached. Returns local path."""
     path = cached_hdf5_path(download_url)
     if os.path.exists(path):
         print(f"Cache hit: {path}")
         return path
-
-    # Use a temp file then rename — safe if multiple workers race
     tmp_path = path + f".{uuid.uuid4().hex}.tmp"
-    print(f"Downloading HDF5 → {tmp_path}")
+    print(f"Downloading HDF5...")
     try:
         r = requests.get(
             download_url,
@@ -46,8 +42,8 @@ def ensure_downloaded(download_url: str, token: str) -> str:
             for chunk in r.iter_content(chunk_size=16 * 1024 * 1024):
                 if chunk:
                     f.write(chunk)
-        os.rename(tmp_path, path)   # atomic on Linux
-        print(f"Cached at: {path}")
+        os.rename(tmp_path, path)
+        print(f"Cached: {path}")
     except Exception:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
@@ -56,39 +52,86 @@ def ensure_downloaded(download_url: str, token: str) -> str:
 
 
 # =========================================================
+# EASE-2 GLOBAL 9 km GRID  (EPSG:6933)
+# =========================================================
+
+EASE2_ROWS      = 1624
+EASE2_COLS      = 3856
+EASE2_MAP_SCALE = 9008.055210
+EASE2_R0        = (EASE2_ROWS - 1) / 2
+EASE2_S0        = (EASE2_COLS - 1) / 2
+EASE2_R_MAJOR   = 6378137.0
+EASE2_COS_LAT0  = math.cos(math.radians(30))
+
+def latlon_to_ease2(lat: float, lon: float) -> tuple[int, int]:
+    lat_r = math.radians(lat)
+    lon_r = math.radians(lon)
+    x = EASE2_R_MAJOR * lon_r * EASE2_COS_LAT0
+    y = (EASE2_R_MAJOR * math.sin(lat_r)) / EASE2_COS_LAT0
+    col = int(round(EASE2_S0 + x / EASE2_MAP_SCALE))
+    row = int(round(EASE2_R0 - y / EASE2_MAP_SCALE))
+    return max(0, min(EASE2_ROWS - 1, row)), max(0, min(EASE2_COLS - 1, col))
+
+def ease2_to_latlon(row: int, col: int) -> tuple[float, float]:
+    x   = (col - EASE2_S0) * EASE2_MAP_SCALE
+    y   = (EASE2_R0 - row) * EASE2_MAP_SCALE
+    lon = math.degrees(x / (EASE2_R_MAJOR * EASE2_COS_LAT0))
+    lat = math.degrees(math.asin(y * EASE2_COS_LAT0 / EASE2_R_MAJOR))
+    return round(lat, 4), round(lon, 4)
+
+
+# =========================================================
 # REQUEST MODELS
 # =========================================================
 
 class IrelandExtractRequest(BaseModel):
-    date: str = "2026-05-18"
+    date: str = "2026-05-17"
     download_url: str
     nasa_token: Optional[str] = None
 
+    model_config = {
+        "json_schema_extra": {
+            "examples": [{
+                "date": "2026-05-17",
+                "download_url": "https://data.nsidc.earthdatacloud.nasa.gov/nsidc-cumulus-prod-protected/SMAP/SPL4SMGP/008/2026/05/16/SMAP_L4_SM_gph_20260516T223000_Vv8011_001.h5",
+                "nasa_token": "your-earthdata-token"
+            }]
+        }
+    }
+
 class PointExtractRequest(BaseModel):
-    lat: float
-    lon: float
-    date: str = "2026-05-18"
+    lat: float = 52.1
+    lon: float = -9.7
+    date: str = "2026-05-17"
     download_url: str
     nasa_token: Optional[str] = None
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [{
+                "lat": 52.1,
+                "lon": -9.7,
+                "date": "2026-05-17",
+                "download_url": "https://data.nsidc.earthdatacloud.nasa.gov/nsidc-cumulus-prod-protected/SMAP/SPL4SMGP/008/2026/05/16/SMAP_L4_SM_gph_20260516T223000_Vv8011_001.h5",
+                "nasa_token": "your-earthdata-token"
+            }]
+        }
+    }
 
 
 # =========================================================
 # HELPERS
 # =========================================================
 
-FILL_VALUE = -9999.0
-
 def clean_array(arr: np.ndarray) -> np.ndarray:
     arr = arr.astype(np.float32)
-    arr[arr <= FILL_VALUE * 0.99] = np.nan   # fill values
-    arr[(arr < 0) | (arr > 1)] = np.nan      # out-of-range
+    arr[arr < -9990] = np.nan
+    arr[(arr < 0) | (arr > 1)] = np.nan
     return arr
 
 def clean_scalar(v) -> Optional[float]:
-    if v is None:
-        return None
     f = float(v)
-    if np.isnan(f) or f < 0 or f > 1:
+    if np.isnan(f) or f < -9990 or f < 0 or f > 1:
         return None
     return round(f, 4)
 
@@ -123,22 +166,29 @@ async def home():
 async def health():
     return {"healthy": True, "utc": datetime.now(timezone.utc).isoformat()}
 
+@app.post("/debug-keys")
+async def debug_keys(request: IrelandExtractRequest):
+    """List all dataset paths in the HDF5 — use once to verify file structure."""
+    token = token_from(request.nasa_token)
+    try:
+        path = ensure_downloaded(request.download_url, token)
+        keys: list[str] = []
+        with h5py.File(path, "r") as f:
+            f.visititems(lambda name, obj: keys.append(name) if isinstance(obj, h5py.Dataset) else None)
+        return {"success": True, "keys": keys}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 @app.post("/extract-ireland")
 async def extract_ireland(request: IrelandExtractRequest):
     token = token_from(request.nasa_token)
-
     try:
         path = ensure_downloaded(request.download_url, token)
-
         with h5py.File(path, "r") as f:
             g = f["Geophysical_Data"]
-
-            # Ireland slice: rows 140-190, cols 1750-1900
             surface  = clean_array(g["sm_surface"] [140:190, 1750:1900])
             rootzone = clean_array(g["sm_rootzone"][140:190, 1750:1900])
             profile  = clean_array(g["sm_profile"] [140:190, 1750:1900])
-
         return {
             "success": True,
             "date": request.date,
@@ -150,7 +200,6 @@ async def extract_ireland(request: IrelandExtractRequest):
             },
             "source": "SMAP L4 Regional Extraction (h5py)",
         }
-
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -158,48 +207,35 @@ async def extract_ireland(request: IrelandExtractRequest):
 @app.post("/extract-point")
 async def extract_point(request: PointExtractRequest):
     token = token_from(request.nasa_token)
-
     try:
         path = ensure_downloaded(request.download_url, token)
 
+        # EASE-2 math replaces reading latitude/longitude datasets from HDF5
+        row, col = latlon_to_ease2(request.lat, request.lon)
+        pixel_lat, pixel_lon = ease2_to_latlon(row, col)
+
         with h5py.File(path, "r") as f:
             g = f["Geophysical_Data"]
-
-            # Read lat/lon grids to find the nearest pixel
-            lat_grid = g["latitude"] [:]
-            lon_grid = g["longitude"][:]
-
-            dist = np.sqrt(
-                (lat_grid - request.lat) ** 2 +
-                (lon_grid - request.lon) ** 2
-            )
-            flat_idx     = int(np.nanargmin(dist))
-            row, col     = np.unravel_index(flat_idx, dist.shape)
-            nearest_dist = float(dist[row, col])
-
             surface  = clean_scalar(g["sm_surface"] [row, col])
             rootzone = clean_scalar(g["sm_rootzone"][row, col])
             profile  = clean_scalar(g["sm_profile"] [row, col])
-            pix_lat  = float(lat_grid[row, col])
-            pix_lon  = float(lon_grid[row, col])
 
         return {
             "success": True,
             "date": request.date,
-            "location":      {"lat": request.lat, "lon": request.lon},
+            "location": {"lat": request.lat, "lon": request.lon},
             "nearest_pixel": {
-                "row": int(row), "col": int(col),
-                "distance_degrees": round(nearest_dist, 5),
-                "pixel_lat": round(pix_lat, 4),
-                "pixel_lon": round(pix_lon, 4),
+                "row": row, "col": col,
+                "pixel_lat": pixel_lat,
+                "pixel_lon": pixel_lon,
             },
             "soil_moisture": {
                 "sm_surface":  {"value": surface,  "unit": "m³/m³"},
                 "sm_rootzone": {"value": rootzone, "unit": "m³/m³"},
                 "sm_profile":  {"value": profile,  "unit": "m³/m³"},
             },
-            "source": "SMAP L4 Point Extraction (h5py)",
+            "source": "SMAP L4 Point Extraction (h5py + EASE-2)",
         }
-
     except Exception as e:
         return {"success": False, "error": str(e)}
+
