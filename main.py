@@ -8,7 +8,7 @@ import requests
 import os
 
 app = FastAPI(
-    title="SMAP Ireland Real Extractor"
+    title="SMAP Scientific Extractor"
 )
 
 # =========================================================
@@ -46,7 +46,7 @@ async def home():
 
     return {
         "message":
-        "SMAP Ireland Real Extractor Running"
+        "SMAP Scientific Extractor Running"
     }
 
 
@@ -63,37 +63,10 @@ async def health():
 
 
 # =========================================================
-# APPROXIMATE EASE2 CONVERSION
-# =========================================================
-#
-# Temporary approximation for Ireland.
-# Later we can replace with exact EASE2 projection.
-#
-# =========================================================
-
-def latlon_to_smap_index(
-    lat,
-    lon
-):
-
-    # Approximate Ireland mapping
-
-    row = int(
-        162 - ((lat - 51.0) * 8)
-    )
-
-    col = int(
-        1800 + ((lon + 10.5) * 18)
-    )
-
-    return row, col
-
-
-# =========================================================
 # CLEAN VALUES
 # =========================================================
 
-def clean_values(arr):
+def clean_array(arr):
 
     arr = np.where(
         arr < -9990,
@@ -109,6 +82,20 @@ def clean_values(arr):
     )
 
     return arr
+
+
+def clean_scalar(v):
+
+    if v is None:
+        return None
+
+    if np.isnan(v):
+        return None
+
+    if v < 0 or v > 1:
+        return None
+
+    return float(v)
 
 
 # =========================================================
@@ -146,7 +133,37 @@ def download_hdf5(
 
 
 # =========================================================
-# IRELAND REGIONAL EXTRACTION
+# FIND NEAREST PIXEL
+# =========================================================
+
+def find_nearest_pixel(
+    target_lat,
+    target_lon,
+    lat_grid,
+    lon_grid
+):
+
+    distance = np.sqrt(
+        (lat_grid - target_lat) ** 2 +
+        (lon_grid - target_lon) ** 2
+    )
+
+    flat_index = np.nanargmin(distance)
+
+    row, col = np.unravel_index(
+        flat_index,
+        distance.shape
+    )
+
+    nearest_distance = float(
+        distance[row, col]
+    )
+
+    return row, col, nearest_distance
+
+
+# =========================================================
+# REGIONAL EXTRACTION
 # =========================================================
 
 @app.post("/extract-ireland")
@@ -154,7 +171,7 @@ async def extract_ireland(
     request: IrelandExtractRequest
 ):
 
-    filename = "smap_temp.h5"
+    filename = "smap_ireland.h5"
 
     try:
 
@@ -180,9 +197,7 @@ async def extract_ireland(
                 detail="NASA token is required"
             )
 
-        print(
-            f"Downloading: {download_url}"
-        )
+        print("Downloading HDF5...")
 
         download_hdf5(
             download_url,
@@ -190,9 +205,7 @@ async def extract_ireland(
             filename
         )
 
-        print(
-            "Download complete"
-        )
+        print("Opening HDF5...")
 
         with h5py.File(
             filename,
@@ -201,13 +214,13 @@ async def extract_ireland(
 
             g = f["Geophysical_Data"]
 
-            sm_surface = g[
-                "sm_surface"
-            ][:]
+            sm_surface = clean_array(
+                g["sm_surface"][:]
+            )
 
-            sm_rootzone = g[
-                "sm_rootzone"
-            ][:]
+            sm_rootzone = clean_array(
+                g["sm_rootzone"][:]
+            )
 
             ireland_surface = sm_surface[
                 140:190,
@@ -219,27 +232,7 @@ async def extract_ireland(
                 1750:1900
             ]
 
-            ireland_surface = clean_values(
-                ireland_surface
-            )
-
-            ireland_rootzone = clean_values(
-                ireland_rootzone
-            )
-
-            surface_valid = (
-                ireland_surface.astype(
-                    np.float64
-                )
-            )
-
-            rootzone_valid = (
-                ireland_rootzone.astype(
-                    np.float64
-                )
-            )
-
-            result = {
+            return {
 
                 "success": True,
 
@@ -256,28 +249,28 @@ async def extract_ireland(
                         "mean":
                             float(
                                 np.nanmean(
-                                    surface_valid
+                                    ireland_surface
                                 )
                             ),
 
                         "median":
                             float(
                                 np.nanmedian(
-                                    surface_valid
+                                    ireland_surface
                                 )
                             ),
 
                         "min":
                             float(
                                 np.nanmin(
-                                    surface_valid
+                                    ireland_surface
                                 )
                             ),
 
                         "max":
                             float(
                                 np.nanmax(
-                                    surface_valid
+                                    ireland_surface
                                 )
                             ),
 
@@ -290,28 +283,28 @@ async def extract_ireland(
                         "mean":
                             float(
                                 np.nanmean(
-                                    rootzone_valid
+                                    ireland_rootzone
                                 )
                             ),
 
                         "median":
                             float(
                                 np.nanmedian(
-                                    rootzone_valid
+                                    ireland_rootzone
                                 )
                             ),
 
                         "min":
                             float(
                                 np.nanmin(
-                                    rootzone_valid
+                                    ireland_rootzone
                                 )
                             ),
 
                         "max":
                             float(
                                 np.nanmax(
-                                    rootzone_valid
+                                    ireland_rootzone
                                 )
                             ),
 
@@ -320,26 +313,9 @@ async def extract_ireland(
                     }
                 },
 
-                "valid_pixels_percent":
-                    round(
-                        float(
-                            (
-                                ~np.isnan(
-                                    surface_valid
-                                )
-                            ).mean() * 100
-                        ),
-                        2
-                    ),
-
                 "source":
-                    "SMAP L4 HDF5 Extraction",
-
-                "resolution":
-                    "Approximate Ireland EASE2 regional slice"
+                    "SMAP L4 Regional Extraction"
             }
-
-            return result
 
     except Exception as e:
 
@@ -353,22 +329,16 @@ async def extract_ireland(
 
     finally:
 
-        if os.path.exists(
-            filename
-        ):
+        if os.path.exists(filename):
 
             try:
-
-                os.remove(
-                    filename
-                )
-
+                os.remove(filename)
             except:
                 pass
 
 
 # =========================================================
-# POINT EXTRACTION
+# TRUE POINT EXTRACTION
 # =========================================================
 
 @app.post("/extract-point")
@@ -402,22 +372,7 @@ async def extract_point(
                 detail="NASA token is required"
             )
 
-        # =================================================
-        # CONVERT LAT/LON
-        # =================================================
-
-        row, col = latlon_to_smap_index(
-            request.lat,
-            request.lon
-        )
-
-        print(
-            f"SMAP index: row={row}, col={col}"
-        )
-
-        # =================================================
-        # DOWNLOAD FILE
-        # =================================================
+        print("Downloading HDF5...")
 
         download_hdf5(
             download_url,
@@ -425,9 +380,7 @@ async def extract_point(
             filename
         )
 
-        # =================================================
-        # OPEN HDF5
-        # =================================================
+        print("Opening HDF5...")
 
         with h5py.File(
             filename,
@@ -436,39 +389,46 @@ async def extract_point(
 
             g = f["Geophysical_Data"]
 
-            sm_surface = g[
-                "sm_surface"
-            ]
+            # =================================================
+            # LOAD VARIABLES
+            # =================================================
 
-            sm_rootzone = g[
-                "sm_rootzone"
-            ]
+            sm_surface = g["sm_surface"][:]
 
-            surface_value = float(
+            sm_rootzone = g["sm_rootzone"][:]
+
+            latitude = g["latitude"][:]
+
+            longitude = g["longitude"][:]
+
+            # =================================================
+            # FIND NEAREST PIXEL
+            # =================================================
+
+            row, col, nearest_distance = (
+                find_nearest_pixel(
+                    request.lat,
+                    request.lon,
+                    latitude,
+                    longitude
+                )
+            )
+
+            print(
+                f"Nearest pixel: row={row}, col={col}"
+            )
+
+            # =================================================
+            # EXTRACT VALUES
+            # =================================================
+
+            surface_value = clean_scalar(
                 sm_surface[row, col]
             )
 
-            rootzone_value = float(
+            rootzone_value = clean_scalar(
                 sm_rootzone[row, col]
             )
-
-            # Clean invalid
-
-            if (
-                surface_value < 0
-                or
-                surface_value > 1
-            ):
-
-                surface_value = None
-
-            if (
-                rootzone_value < 0
-                or
-                rootzone_value > 1
-            ):
-
-                rootzone_value = None
 
             return {
 
@@ -486,13 +446,29 @@ async def extract_point(
                         request.lon
                 },
 
-                "smap_index": {
+                "nearest_pixel": {
 
                     "row":
-                        row,
+                        int(row),
 
                     "col":
-                        col
+                        int(col),
+
+                    "distance_degrees":
+                        round(
+                            nearest_distance,
+                            5
+                        ),
+
+                    "pixel_lat":
+                        float(
+                            latitude[row, col]
+                        ),
+
+                    "pixel_lon":
+                        float(
+                            longitude[row, col]
+                        )
                 },
 
                 "soil_moisture": {
@@ -517,10 +493,7 @@ async def extract_point(
                 },
 
                 "source":
-                    "SMAP L4 Point Extraction",
-
-                "note":
-                    "Approximate Ireland EASE2 conversion"
+                    "SMAP L4 Scientific Point Extraction"
             }
 
     except Exception as e:
@@ -535,15 +508,9 @@ async def extract_point(
 
     finally:
 
-        if os.path.exists(
-            filename
-        ):
+        if os.path.exists(filename):
 
             try:
-
-                os.remove(
-                    filename
-                )
-
+                os.remove(filename)
             except:
                 pass
