@@ -4,9 +4,11 @@ from typing import Optional
 import h5py
 import numpy as np
 import requests
+import boto3
 import os
 import uuid
 import hashlib
+import io
 from datetime import datetime, timezone
 import math
 
@@ -19,36 +21,85 @@ app = FastAPI(title="SMAP Scientific Extractor")
 CACHE_DIR = "/tmp/smap_cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
 
-def cached_hdf5_path(download_url: str) -> str:
-    url_hash = hashlib.md5(download_url.encode()).hexdigest()[:12]
+def cached_hdf5_path(key: str) -> str:
+    url_hash = hashlib.md5(key.encode()).hexdigest()[:12]
     return os.path.join(CACHE_DIR, f"smap_{url_hash}.h5")
 
-def ensure_downloaded(download_url: str, token: str) -> str:
+def ensure_downloaded_s3(
+    s3_bucket: str,
+    s3_key: str,
+    aws_access_key_id: str,
+    aws_secret_access_key: str,
+    aws_session_token: str,
+    s3_region: str = "us-west-2",
+) -> str:
+    """Download HDF5 from S3 using temporary NASA Earthdata Cloud credentials."""
+    path = cached_hdf5_path(s3_key)
+    if os.path.exists(path):
+        print(f"[S3] Cache hit: {path}")
+        return path
+
+    print(f"[S3] Downloading s3://{s3_bucket}/{s3_key}")
+    tmp_path = path + f".{uuid.uuid4().hex}.tmp"
+    try:
+        s3 = boto3.client(
+            "s3",
+            region_name=s3_region,
+            aws_access_key_id=aws_access_key_id,
+            aws_secret_access_key=aws_secret_access_key,
+            aws_session_token=aws_session_token,
+        )
+        s3.download_file(s3_bucket, s3_key, tmp_path)
+        os.rename(tmp_path, path)
+        print(f"[S3] Cached: {path}")
+        return path
+    except Exception as e:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise RuntimeError(f"S3 download failed: {e}") from e
+
+def ensure_downloaded_https(download_url: str, token: str) -> str:
+    """Fallback: download via HTTPS with Bearer token (handles EDL redirect)."""
     path = cached_hdf5_path(download_url)
     if os.path.exists(path):
-        print(f"Cache hit: {path}")
+        print(f"[HTTPS] Cache hit: {path}")
         return path
+
+    print(f"[HTTPS] Downloading {download_url}")
     tmp_path = path + f".{uuid.uuid4().hex}.tmp"
-    print(f"Downloading HDF5...")
     try:
-        r = requests.get(
+        session = requests.Session()
+        # Follow redirects manually — strip auth header for S3 presigned URLs
+        response = session.get(
             download_url,
             headers={"Authorization": f"Bearer {token}"},
-            stream=True,
-            timeout=300,
+            allow_redirects=False,
+            timeout=30,
         )
-        r.raise_for_status()
+        while response.status_code in (301, 302, 303, 307, 308):
+            redirect_url = response.headers.get("Location", "")
+            is_s3 = "s3.amazonaws.com" in redirect_url or "s3-us-west" in redirect_url
+            if is_s3:
+                response = requests.get(redirect_url, allow_redirects=True, timeout=300, stream=True)
+            else:
+                response = session.get(
+                    redirect_url,
+                    headers={"Authorization": f"Bearer {token}"},
+                    allow_redirects=False,
+                    timeout=30,
+                )
+        response.raise_for_status()
         with open(tmp_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=16 * 1024 * 1024):
+            for chunk in response.iter_content(chunk_size=16 * 1024 * 1024):
                 if chunk:
                     f.write(chunk)
         os.rename(tmp_path, path)
-        print(f"Cached: {path}")
-    except Exception:
+        print(f"[HTTPS] Cached: {path}")
+        return path
+    except Exception as e:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
-        raise
-    return path
+        raise RuntimeError(f"HTTPS download failed: {e}") from e
 
 
 # =========================================================
@@ -88,16 +139,13 @@ class IrelandExtractRequest(BaseModel):
     date: str = "2026-05-17"
     download_url: str
     nasa_token: Optional[str] = None
-
-    model_config = {
-        "json_schema_extra": {
-            "examples": [{
-                "date": "2026-05-17",
-                "download_url": "https://data.nsidc.earthdatacloud.nasa.gov/nsidc-cumulus-prod-protected/SMAP/SPL4SMGP/008/2026/05/16/SMAP_L4_SM_gph_20260516T223000_Vv8011_001.h5",
-                "nasa_token": "your-earthdata-token"
-            }]
-        }
-    }
+    # S3 credentials (preferred over HTTPS)
+    s3_bucket:             Optional[str] = None
+    s3_key:                Optional[str] = None
+    s3_region:             Optional[str] = "us-west-2"
+    aws_access_key_id:     Optional[str] = None
+    aws_secret_access_key: Optional[str] = None
+    aws_session_token:     Optional[str] = None
 
 class PointExtractRequest(BaseModel):
     lat: float = 52.1
@@ -105,18 +153,38 @@ class PointExtractRequest(BaseModel):
     date: str = "2026-05-17"
     download_url: str
     nasa_token: Optional[str] = None
+    # S3 credentials (preferred over HTTPS)
+    s3_bucket:             Optional[str] = None
+    s3_key:                Optional[str] = None
+    s3_region:             Optional[str] = "us-west-2"
+    aws_access_key_id:     Optional[str] = None
+    aws_secret_access_key: Optional[str] = None
+    aws_session_token:     Optional[str] = None
 
-    model_config = {
-        "json_schema_extra": {
-            "examples": [{
-                "lat": 52.1,
-                "lon": -9.7,
-                "date": "2026-05-17",
-                "download_url": "https://data.nsidc.earthdatacloud.nasa.gov/nsidc-cumulus-prod-protected/SMAP/SPL4SMGP/008/2026/05/16/SMAP_L4_SM_gph_20260516T223000_Vv8011_001.h5",
-                "nasa_token": "your-earthdata-token"
-            }]
-        }
-    }
+
+# =========================================================
+# SHARED DOWNLOAD LOGIC
+# =========================================================
+
+def get_hdf5_path(request) -> str:
+    """S3 credentials → S3 download. Falls back to HTTPS with redirect fix."""
+    if (request.s3_bucket and request.s3_key and
+            request.aws_access_key_id and request.aws_secret_access_key and request.aws_session_token):
+        print(f"[SMAP] Using S3 direct download")
+        return ensure_downloaded_s3(
+            s3_bucket=request.s3_bucket,
+            s3_key=request.s3_key,
+            aws_access_key_id=request.aws_access_key_id,
+            aws_secret_access_key=request.aws_secret_access_key,
+            aws_session_token=request.aws_session_token,
+            s3_region=request.s3_region or "us-west-2",
+        )
+    else:
+        print(f"[SMAP] Using HTTPS download (S3 creds not provided)")
+        token = request.nasa_token or os.getenv("NASA_EARTHDATA_TOKEN")
+        if not token:
+            raise HTTPException(status_code=400, detail="NASA token or S3 credentials required")
+        return ensure_downloaded_https(request.download_url, token)
 
 
 # =========================================================
@@ -147,12 +215,6 @@ def stats(arr: np.ndarray) -> dict:
         "unit":   "m³/m³",
     }
 
-def token_from(request_token: Optional[str]) -> str:
-    t = request_token or os.getenv("NASA_EARTHDATA_TOKEN")
-    if not t:
-        raise HTTPException(status_code=400, detail="NASA token required")
-    return t
-
 
 # =========================================================
 # ROUTES
@@ -168,10 +230,8 @@ async def health():
 
 @app.post("/debug-keys")
 async def debug_keys(request: IrelandExtractRequest):
-    """List all dataset paths in the HDF5 — use once to verify file structure."""
-    token = token_from(request.nasa_token)
     try:
-        path = ensure_downloaded(request.download_url, token)
+        path = get_hdf5_path(request)
         keys: list[str] = []
         with h5py.File(path, "r") as f:
             f.visititems(lambda name, obj: keys.append(name) if isinstance(obj, h5py.Dataset) else None)
@@ -181,9 +241,8 @@ async def debug_keys(request: IrelandExtractRequest):
 
 @app.post("/extract-ireland")
 async def extract_ireland(request: IrelandExtractRequest):
-    token = token_from(request.nasa_token)
     try:
-        path = ensure_downloaded(request.download_url, token)
+        path = get_hdf5_path(request)
         with h5py.File(path, "r") as f:
             g = f["Geophysical_Data"]
             surface  = clean_array(g["sm_surface"] [140:190, 1750:1900])
@@ -203,14 +262,10 @@ async def extract_ireland(request: IrelandExtractRequest):
     except Exception as e:
         return {"success": False, "error": str(e)}
 
-
 @app.post("/extract-point")
 async def extract_point(request: PointExtractRequest):
-    token = token_from(request.nasa_token)
     try:
-        path = ensure_downloaded(request.download_url, token)
-
-        # EASE-2 math replaces reading latitude/longitude datasets from HDF5
+        path = get_hdf5_path(request)
         row, col = latlon_to_ease2(request.lat, request.lon)
         pixel_lat, pixel_lon = ease2_to_latlon(row, col)
 
@@ -238,4 +293,3 @@ async def extract_point(request: PointExtractRequest):
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
-
