@@ -5,3 +5,4 @@ numpy
 h5py
 xarray
 netCDF4
+boto3
